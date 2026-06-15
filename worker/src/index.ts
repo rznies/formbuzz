@@ -1,4 +1,6 @@
 import { Hono } from 'hono';
+// @ts-ignore
+import formbuzzScriptText from '../formbuzz.js';
 
 type Bindings = {
   DB: D1Database;
@@ -8,6 +10,17 @@ type Bindings = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
+
+app.get('/v1/s/formbuzz.js', (c) => {
+  return c.text(formbuzzScriptText, 200, {
+    'Content-Type': 'application/javascript; charset=utf-8',
+    'Cache-Control': 'public, max-age=3600, s-maxage=86400',
+  });
+});
+
+app.get('/v1/s/formbeep.js', (c) => {
+  return c.redirect('/v1/s/formbuzz.js', 307);
+});
 
 app.post('/v1/submit/:apiKey', async (c) => {
   const apiKey = c.req.param('apiKey');

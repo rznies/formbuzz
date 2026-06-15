@@ -1,4 +1,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+vi.mock('../formbuzz.js', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const content = fs.readFileSync(path.resolve(__dirname, '../formbuzz.js'), 'utf8');
+  return {
+    default: content
+  };
+});
+
 import app from './index';
 
 class MockD1 {
@@ -602,3 +612,276 @@ describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
+
+describe('Client-Side Script Server - GET /v1/s/formbuzz.js', () => {
+  it('should serve the formbuzz.js script with correct Content-Type and Cache-Control headers', async () => {
+    const res = await app.request('/v1/s/formbuzz.js', {
+      method: 'GET'
+    }, {
+      DB: {} as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('application/javascript');
+    expect(res.headers.get('Cache-Control')).toBe('public, max-age=3600, s-maxage=86400');
+    const text = await res.text();
+    expect(text).toContain('__FORMBUZZ_TEST__');
+    expect(text).toContain('VERSION = "1.4.0"');
+  });
+
+  it('should redirect GET /v1/s/formbeep.js to /v1/s/formbuzz.js with status 307', async () => {
+    const res = await app.request('/v1/s/formbeep.js', {
+      method: 'GET'
+    }, {
+      DB: {} as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(307);
+    expect(res.headers.get('Location')).toBe('/v1/s/formbuzz.js');
+  });
+});
+
+describe('formbuzz.js Client Script Logic Unit Tests', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  let cleanLabel: (text: string) => string;
+  let resolveFieldLabel: (field: any) => string;
+  let serializeForm: (form: any) => Record<string, string>;
+
+  beforeEach(() => {
+    // Reset globalThis.__FORMBUZZ_TEST__ and mock document / window
+    delete (globalThis as any).__FORMBUZZ_TEST__;
+    (globalThis as any).window = {};
+    (globalThis as any).document = {
+      readyState: 'complete',
+      addEventListener: () => {},
+      currentScript: {
+        getAttribute: (name: string) => name === 'data-api-key' ? 'fbp_test_key' : null,
+        src: 'https://api.formbuzz.com/v1/s/formbuzz.js'
+      },
+      querySelectorAll: () => []
+    };
+
+    // Load/evaluate formbuzz.js
+    const scriptPath = path.resolve(__dirname, '../formbuzz.js');
+    const scriptContent = fs.readFileSync(scriptPath, 'utf8');
+    
+    // Evaluate script
+    const runScript = new Function(scriptContent);
+    runScript();
+
+    const testObject = (globalThis as any).__FORMBUZZ_TEST__;
+    expect(testObject).toBeDefined();
+
+    cleanLabel = testObject.cleanLabel;
+    resolveFieldLabel = testObject.resolveFieldLabel;
+    serializeForm = testObject.serializeForm;
+  });
+
+  describe('cleanLabel', () => {
+    it('should strip trailing colons, asterisks, and whitespaces', () => {
+      expect(cleanLabel('Email Address: *')).toBe('Email Address');
+      expect(cleanLabel('Name *:')).toBe('Name');
+      expect(cleanLabel('  Phone Number:  ')).toBe('Phone Number');
+      expect(cleanLabel('Age')).toBe('Age');
+    });
+  });
+
+  describe('resolveFieldLabel', () => {
+    it('should resolve label from explicit label[for]', () => {
+      // Mock document.querySelector
+      (globalThis as any).document.querySelector = (selector: string) => {
+        if (selector === 'label[for="input-id"]') {
+          return { textContent: 'Explicit Label *:' };
+        }
+        return null;
+      };
+
+      const field = {
+        id: 'input-id',
+        name: 'test-name',
+        getAttribute: () => null
+      };
+
+      expect(resolveFieldLabel(field)).toBe('Explicit Label');
+    });
+
+    it('should resolve label from parent label element', () => {
+      // Setup a parent label
+      const mockParent = {
+        tagName: 'LABEL',
+        childNodes: [
+          { nodeType: 3, textContent: 'Parent Label Text: ' },
+          { nodeType: 1, tagName: 'INPUT' }
+        ]
+      };
+
+      const field = {
+        parentElement: mockParent,
+        name: 'test-name',
+        getAttribute: () => null
+      };
+
+      expect(resolveFieldLabel(field)).toBe('Parent Label Text');
+    });
+
+    it('should resolve label from previous sibling label element', () => {
+      const mockSibling = {
+        tagName: 'LABEL',
+        textContent: 'Sibling Label:'
+      };
+
+      const field = {
+        name: 'test-name',
+        previousElementSibling: mockSibling,
+        getAttribute: () => null
+      };
+
+      expect(resolveFieldLabel(field)).toBe('Sibling Label');
+    });
+
+    it('should resolve label from previous sibling element with form-label class', () => {
+      const mockSibling = {
+        tagName: 'DIV',
+        className: 'form-label',
+        textContent: 'Class Label:'
+      };
+
+      const field = {
+        name: 'test-name',
+        previousElementSibling: mockSibling,
+        getAttribute: () => null
+      };
+
+      expect(resolveFieldLabel(field)).toBe('Class Label');
+    });
+
+    it('should resolve label from aria-label attribute', () => {
+      const field = {
+        getAttribute: (attr: string) => attr === 'aria-label' ? 'Aria Label' : null
+      };
+
+      expect(resolveFieldLabel(field)).toBe('Aria Label');
+    });
+
+    it('should resolve label from placeholder attribute', () => {
+      const field = {
+        placeholder: 'Placeholder Label',
+        getAttribute: () => null
+      };
+
+      expect(resolveFieldLabel(field)).toBe('Placeholder Label');
+    });
+
+    it('should fallback to name if no label found', () => {
+      const field = {
+        name: 'field_name',
+        getAttribute: () => null
+      };
+
+      expect(resolveFieldLabel(field)).toBe('field_name');
+    });
+  });
+
+  describe('serializeForm', () => {
+    it('should serialize form fields and ignore ignored/disabled/buttons', () => {
+      const fields = [
+        { name: 'name', value: 'Alice', type: 'text', disabled: false, hasAttribute: () => false, getAttribute: () => null },
+        { name: 'email', value: 'alice@test.com', type: 'email', disabled: false, hasAttribute: () => false, getAttribute: () => null },
+        { name: 'ignored_field', value: 'blah', type: 'text', disabled: false, hasAttribute: (attr: string) => attr === 'data-formbuzz-ignore', getAttribute: () => null },
+        { name: 'disabled_field', value: 'blah', type: 'text', disabled: true, hasAttribute: () => false, getAttribute: () => null },
+        { name: 'submit_btn', value: 'Submit', type: 'submit', disabled: false, hasAttribute: () => false, getAttribute: () => null }
+      ];
+
+      const form = {
+        elements: fields
+      };
+
+      // Set global document querySelector to return null for labels
+      (globalThis as any).document.querySelector = () => null;
+
+      const payload = serializeForm(form);
+      expect(payload).toEqual({
+        name: 'Alice',
+        email: 'alice@test.com'
+      });
+    });
+
+    it('should serialize file inputs using filenames', () => {
+      const fileField = {
+        name: 'resume',
+        type: 'file',
+        files: [
+          { name: 'resume.pdf' },
+          { name: 'cover_letter.pdf' }
+        ],
+        disabled: false,
+        hasAttribute: () => false,
+        getAttribute: () => null
+      };
+
+      const form = {
+        elements: [fileField]
+      };
+
+      const payload = serializeForm(form);
+      expect(payload).toEqual({
+        resume: 'resume.pdf, cover_letter.pdf'
+      });
+    });
+
+    it('should serialize select-multiple inputs', () => {
+      const selectField = {
+        name: 'colors',
+        type: 'select-multiple',
+        options: [
+          { selected: true, value: 'red', text: 'Red' },
+          { selected: false, value: 'green', text: 'Green' },
+          { selected: true, value: 'blue', text: 'Blue' }
+        ],
+        disabled: false,
+        hasAttribute: () => false,
+        getAttribute: () => null
+      };
+
+      const form = {
+        elements: [selectField]
+      };
+
+      const payload = serializeForm(form);
+      expect(payload).toEqual({
+        colors: 'red, blue'
+      });
+    });
+
+    it('should serialize multiple checkboxes with the same name/label by joining their values', () => {
+      const mockSibling = {
+        tagName: 'DIV',
+        className: 'form-label',
+        textContent: 'Hobbies:'
+      };
+
+      const fields = [
+        { name: 'hobby', value: 'reading', type: 'checkbox', checked: true, previousElementSibling: mockSibling, disabled: false, hasAttribute: () => false, getAttribute: () => null },
+        { name: 'hobby', value: 'sports', type: 'checkbox', checked: true, previousElementSibling: mockSibling, disabled: false, hasAttribute: () => false, getAttribute: () => null },
+        { name: 'hobby', value: 'music', type: 'checkbox', checked: false, previousElementSibling: mockSibling, disabled: false, hasAttribute: () => false, getAttribute: () => null }
+      ];
+
+      const form = {
+        elements: fields
+      };
+
+      const payload = serializeForm(form);
+      expect(payload).toEqual({
+        Hobbies: 'reading, sports'
+      });
+    });
+  });
+});
+
