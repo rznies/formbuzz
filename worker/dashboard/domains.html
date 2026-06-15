@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="clerk-publishable-key" content="{{CLERK_PUBLISHABLE_KEY}}">
+  <meta name="description" content="FormBuzz — Manage allowed domains for your form submissions.">
+  <title>FormBuzz — Domains</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="logo-lg">FB</div>
+      <h1>Welcome to FormBuzz</h1>
+      <p>Sign in to manage your domains.</p>
+      <div id="clerk-auth"></div>
+    </div>
+  </div>
+
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo">FB</div>
+        <h1>FormBuzz</h1>
+      </div>
+      <nav class="sidebar-nav" id="sidebar-nav"></nav>
+      <div class="sidebar-footer">
+        <div class="text-sm text-muted" id="sidebar-user"></div>
+        <button class="btn btn-ghost btn-sm mt-md" id="logout-btn" style="width:100%">Sign Out</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <div class="page-header">
+        <h2>Allowed Domains</h2>
+        <p>Only form submissions from these domains will be accepted.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🌐 Domain Allowlist</div>
+        <div class="input-group">
+          <input class="input" type="text" id="domain-input" placeholder="example.com" />
+          <button class="btn btn-primary" id="add-domain-btn">Add</button>
+        </div>
+        <div class="chip-list" id="domain-chips">
+          <div class="loading-overlay"><div class="spinner"></div></div>
+        </div>
+        <div style="margin-top:var(--space-lg);text-align:right;">
+          <button class="btn btn-primary" id="save-domains-btn">Save Changes</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:var(--space-lg)">
+        <div class="card-title">ℹ️ Tips</div>
+        <ul style="list-style:none;padding:0;color:var(--text-secondary);font-size:0.875rem;">
+          <li style="margin-bottom:var(--space-sm);">• Enter bare hostnames (e.g. <code class="mono">mysite.com</code>), not full URLs.</li>
+          <li style="margin-bottom:var(--space-sm);">• Add <code class="mono">localhost</code> for local development testing.</li>
+          <li>• Use <code class="mono">*</code> to allow all domains (not recommended for production).</li>
+        </ul>
+      </div>
+    </main>
+  </div>
+
+  <script src="/dashboard/shared.js"></script>
+  <script>
+    var domains = [];
+
+    function renderChips() {
+      var container = document.getElementById("domain-chips");
+      if (domains.length === 0) {
+        container.innerHTML = '<div class="empty-state"><div class="icon">🌐</div><p>No domains added yet.</p></div>';
+        return;
+      }
+      var html = "";
+      for (var i = 0; i < domains.length; i++) {
+        html += '<span class="chip">' + domains[i] + ' <span class="chip-remove" data-idx="' + i + '">✕</span></span>';
+      }
+      container.innerHTML = html;
+
+      var removeBtns = container.querySelectorAll(".chip-remove");
+      for (var j = 0; j < removeBtns.length; j++) {
+        removeBtns[j].addEventListener("click", function () {
+          var idx = parseInt(this.getAttribute("data-idx"));
+          domains.splice(idx, 1);
+          renderChips();
+        });
+      }
+    }
+
+    FormBuzz.initClerk(function () {
+      FormBuzz.apiRequest("GET", "/v1/dashboard/domains").then(function (data) {
+        domains = data.domains || [];
+        renderChips();
+      }).catch(function (err) {
+        FormBuzz.showToast(err.message, "error");
+      });
+
+      document.getElementById("add-domain-btn").addEventListener("click", function () {
+        var input = document.getElementById("domain-input");
+        var val = input.value.trim().toLowerCase();
+        if (!val) return;
+        if (domains.indexOf(val) !== -1) {
+          FormBuzz.showToast("Domain already added", "error");
+          return;
+        }
+        domains.push(val);
+        renderChips();
+        input.value = "";
+        input.focus();
+      });
+
+      document.getElementById("domain-input").addEventListener("keypress", function (e) {
+        if (e.key === "Enter") document.getElementById("add-domain-btn").click();
+      });
+
+      document.getElementById("save-domains-btn").addEventListener("click", function () {
+        FormBuzz.apiRequest("PUT", "/v1/dashboard/domains", { domains: domains }).then(function () {
+          FormBuzz.showToast("Domains saved successfully!");
+        }).catch(function (err) {
+          FormBuzz.showToast(err.message, "error");
+        });
+      });
+    });
+  </script>
+</body>
+</html>
