@@ -1,0 +1,21 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "formbuzz-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "FORMBUZZ_DB",
+      "database_id": "FORMBUZZ_DB_ID",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "vars": {
+    "TWILIO_ACCOUNT_SID": "ACmock",
+    "TWILIO_WHATSAPP_NUMBER": "whatsapp:+14155552671"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "formbuzz-worker",
+  "version": "1.0.0",
+  "description": "FormBuzz serverless API ingestion Worker",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240529.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "wrangler": "^3.60.0"
+  }
+}
