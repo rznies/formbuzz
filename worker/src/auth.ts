@@ -30,7 +30,7 @@ function getJWKS(issuerUrl: string) {
  *
  * On failure, returns 401 with a JSON error body.
  */
-export const clerkAuth = createMiddleware<{ Bindings: ClerkBindings }>(
+export const clerkAuth = createMiddleware<{ Bindings: ClerkBindings; Variables: { userId: string } }>(
   async (c, next) => {
     const authHeader = c.req.header('Authorization');
 

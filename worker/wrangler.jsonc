@@ -32,6 +32,11 @@
       "fallthrough": true
     }
   ],
+  "triggers": {
+    "crons": [
+      "0 0 * * *"
+    ]
+  },
   "vars": {
     "TWILIO_ACCOUNT_SID": "ACmock",
     "TWILIO_WHATSAPP_NUMBER": "whatsapp:+14155552671",
