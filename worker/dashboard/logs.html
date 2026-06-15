@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="clerk-publishable-key" content="{{CLERK_PUBLISHABLE_KEY}}">
+  <meta name="description" content="FormBuzz — View form submission delivery logs.">
+  <title>FormBuzz — Logs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="logo-lg">FB</div>
+      <h1>Welcome to FormBuzz</h1>
+      <p>Sign in to view your logs.</p>
+      <div id="clerk-auth"></div>
+    </div>
+  </div>
+
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo">FB</div>
+        <h1>FormBuzz</h1>
+      </div>
+      <nav class="sidebar-nav" id="sidebar-nav"></nav>
+      <div class="sidebar-footer">
+        <div class="text-sm text-muted" id="sidebar-user"></div>
+        <button class="btn btn-ghost btn-sm mt-md" id="logout-btn" style="width:100%">Sign Out</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <div class="page-header">
+        <h2>Submission Logs</h2>
+        <p>Recent form submission delivery records. Submission data is purged after viewing on WhatsApp.</p>
+      </div>
+
+      <div class="card">
+        <div id="logs-table">
+          <div class="loading-overlay"><div class="spinner"></div></div>
+        </div>
+        <div class="pagination" id="pagination"></div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/dashboard/shared.js"></script>
+  <script>
+    var currentPage = 1;
+    var pageSize = 15;
+
+    function statusBadge(status) {
+      var cls = "badge-warning";
+      if (status === "sent") cls = "badge-success";
+      else if (status === "failed") cls = "badge-danger";
+      return '<span class="badge ' + cls + '">' + (status || "pending") + '</span>';
+    }
+
+    function loadLogs(page) {
+      currentPage = page || 1;
+      var container = document.getElementById("logs-table");
+      container.innerHTML = '<div class="loading-overlay"><div class="spinner"></div></div>';
+
+      FormBuzz.apiRequest("GET", "/v1/dashboard/logs?page=" + currentPage + "&limit=" + pageSize).then(function (data) {
+        var logs = data.logs || [];
+        var total = data.total || 0;
+        var totalPages = Math.ceil(total / pageSize) || 1;
+
+        if (logs.length === 0) {
+          container.innerHTML = '<div class="empty-state"><div class="icon">📋</div><p>No submissions yet.</p></div>';
+          document.getElementById("pagination").innerHTML = "";
+          return;
+        }
+
+        var html = '<div class="table-wrap"><table><thead><tr>';
+        html += '<th>Domain</th><th>Fields</th><th>Ref</th><th>Status</th><th>Viewed</th><th>Date</th>';
+        html += '</tr></thead><tbody>';
+
+        for (var i = 0; i < logs.length; i++) {
+          var log = logs[i];
+          var fields = "—";
+          try { fields = JSON.parse(log.field_names || "[]").join(", "); } catch (e) {}
+          html += '<tr>';
+          html += '<td style="color:var(--text-primary);font-weight:500;">' + (log.domain || "—") + '</td>';
+          html += '<td class="text-sm">' + fields + '</td>';
+          html += '<td><code class="mono">' + (log.submission_ref || "—") + '</code></td>';
+          html += '<td>' + statusBadge(log.delivery_status) + '</td>';
+          html += '<td class="text-sm">' + (log.viewed_count || 0) + '</td>';
+          html += '<td class="text-sm">' + FormBuzz.formatDate(log.created_at) + '</td>';
+          html += '</tr>';
+        }
+        html += '</tbody></table></div>';
+        container.innerHTML = html;
+
+        // Pagination
+        var pagHtml = "";
+        if (currentPage > 1) {
+          pagHtml += '<button class="btn btn-ghost btn-sm" onclick="loadLogs(' + (currentPage - 1) + ')">← Prev</button>';
+        }
+        for (var p = 1; p <= totalPages; p++) {
+          pagHtml += '<button class="btn btn-ghost btn-sm' + (p === currentPage ? ' active' : '') + '" onclick="loadLogs(' + p + ')">' + p + '</button>';
+        }
+        if (currentPage < totalPages) {
+          pagHtml += '<button class="btn btn-ghost btn-sm" onclick="loadLogs(' + (currentPage + 1) + ')">Next →</button>';
+        }
+        document.getElementById("pagination").innerHTML = pagHtml;
+      }).catch(function (err) {
+        FormBuzz.showToast(err.message, "error");
+      });
+    }
+
+    FormBuzz.initClerk(function () {
+      loadLogs(1);
+    });
+  </script>
+</body>
+</html>

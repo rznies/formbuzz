@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="clerk-publishable-key" content="{{CLERK_PUBLISHABLE_KEY}}">
+  <meta name="description" content="FormBuzz — Manage incoming webhooks for third-party integrations.">
+  <title>FormBuzz — Webhooks</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="logo-lg">FB</div>
+      <h1>Welcome to FormBuzz</h1>
+      <p>Sign in to manage your webhooks.</p>
+      <div id="clerk-auth"></div>
+    </div>
+  </div>
+
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo">FB</div>
+        <h1>FormBuzz</h1>
+      </div>
+      <nav class="sidebar-nav" id="sidebar-nav"></nav>
+      <div class="sidebar-footer">
+        <div class="text-sm text-muted" id="sidebar-user"></div>
+        <button class="btn btn-ghost btn-sm mt-md" id="logout-btn" style="width:100%">Sign Out</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <div class="page-header">
+        <h2>Webhooks</h2>
+        <p>Create incoming webhook URLs for third-party form platforms (Webflow, Jotform, Tally, etc.).</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title flex-between">
+          <span>🔗 Your Webhooks</span>
+          <button class="btn btn-primary btn-sm" id="new-webhook-btn">+ New Webhook</button>
+        </div>
+        <div id="webhook-list">
+          <div class="loading-overlay"><div class="spinner"></div></div>
+        </div>
+      </div>
+
+      <!-- Create Webhook Form (hidden by default) -->
+      <div class="card hidden" id="create-webhook-card" style="margin-top:var(--space-lg)">
+        <div class="card-title">Create Webhook</div>
+        <div style="margin-bottom:var(--space-md)">
+          <label for="wh-name">Integration Name</label>
+          <input class="input" type="text" id="wh-name" placeholder="e.g. Webflow Contact Form" />
+        </div>
+        <div style="margin-bottom:var(--space-md)">
+          <label for="wh-numbers">WhatsApp Numbers (optional, comma-separated)</label>
+          <input class="input" type="text" id="wh-numbers" placeholder="+15550100, +15550200" />
+        </div>
+        <div style="display:flex;gap:var(--space-sm);">
+          <button class="btn btn-primary" id="submit-webhook-btn">Create</button>
+          <button class="btn btn-ghost" id="cancel-webhook-btn">Cancel</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/dashboard/shared.js"></script>
+  <script>
+    function loadWebhooks() {
+      var container = document.getElementById("webhook-list");
+      FormBuzz.apiRequest("GET", "/v1/dashboard/webhooks").then(function (data) {
+        var webhooks = data.webhooks || [];
+        if (webhooks.length === 0) {
+          container.innerHTML = '<div class="empty-state"><div class="icon">🔗</div><p>No webhooks yet. Create one to get started.</p></div>';
+          return;
+        }
+
+        var origin = window.location.origin;
+        var html = '<div class="table-wrap"><table><thead><tr><th>Name</th><th>Endpoint URL</th><th>Created</th><th></th></tr></thead><tbody>';
+        for (var i = 0; i < webhooks.length; i++) {
+          var wh = webhooks[i];
+          var url = origin + "/v1/webhook/" + wh.id;
+          html += '<tr>';
+          html += '<td style="color:var(--text-primary);font-weight:500;">' + wh.name + '</td>';
+          html += '<td><code class="mono text-sm" style="cursor:pointer;" onclick="FormBuzz.copyToClipboard(\'' + url + '\')">' + url + '</code></td>';
+          html += '<td class="text-sm">' + FormBuzz.formatDate(wh.created_at) + '</td>';
+          html += '<td><button class="btn btn-danger btn-sm delete-wh-btn" data-id="' + wh.id + '">Delete</button></td>';
+          html += '</tr>';
+        }
+        html += '</tbody></table></div>';
+        container.innerHTML = html;
+
+        var deleteBtns = container.querySelectorAll(".delete-wh-btn");
+        for (var j = 0; j < deleteBtns.length; j++) {
+          deleteBtns[j].addEventListener("click", function () {
+            var whId = this.getAttribute("data-id");
+            if (confirm("Delete this webhook? This cannot be undone.")) {
+              FormBuzz.apiRequest("DELETE", "/v1/dashboard/webhooks/" + whId).then(function () {
+                FormBuzz.showToast("Webhook deleted.");
+                loadWebhooks();
+              }).catch(function (err) {
+                FormBuzz.showToast(err.message, "error");
+              });
+            }
+          });
+        }
+      }).catch(function (err) {
+        FormBuzz.showToast(err.message, "error");
+      });
+    }
+
+    FormBuzz.initClerk(function () {
+      loadWebhooks();
+
+      document.getElementById("new-webhook-btn").addEventListener("click", function () {
+        document.getElementById("create-webhook-card").classList.remove("hidden");
+      });
+
+      document.getElementById("cancel-webhook-btn").addEventListener("click", function () {
+        document.getElementById("create-webhook-card").classList.add("hidden");
+        document.getElementById("wh-name").value = "";
+        document.getElementById("wh-numbers").value = "";
+      });
+
+      document.getElementById("submit-webhook-btn").addEventListener("click", function () {
+        var name = document.getElementById("wh-name").value.trim();
+        if (!name) {
+          FormBuzz.showToast("Please enter an integration name.", "error");
+          return;
+        }
+        var numbersStr = document.getElementById("wh-numbers").value.trim();
+        var numbers = numbersStr ? numbersStr.split(",").map(function (n) { return n.trim(); }).filter(Boolean) : null;
+
+        FormBuzz.apiRequest("POST", "/v1/dashboard/webhooks", {
+          name: name,
+          whatsapp_numbers: numbers
+        }).then(function () {
+          FormBuzz.showToast("Webhook created!");
+          document.getElementById("create-webhook-card").classList.add("hidden");
+          document.getElementById("wh-name").value = "";
+          document.getElementById("wh-numbers").value = "";
+          loadWebhooks();
+        }).catch(function (err) {
+          FormBuzz.showToast(err.message, "error");
+        });
+      });
+    });
+  </script>
+</body>
+</html>

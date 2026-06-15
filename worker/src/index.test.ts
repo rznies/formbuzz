@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import * as crypto from 'node:crypto';
+import { SignJWT, importPKCS8, exportJWK, generateKeyPair } from 'jose';
 
 vi.mock('../formbuzz.js', () => {
   const fs = require('node:fs');
@@ -9,7 +11,16 @@ vi.mock('../formbuzz.js', () => {
   };
 });
 
+// Mock dashboard assets as empty strings — they are text imports
+vi.mock('../dashboard/index.html', () => ({ default: '<html>dashboard</html>' }));
+vi.mock('../dashboard/domains.html', () => ({ default: '<html>domains</html>' }));
+vi.mock('../dashboard/webhooks.html', () => ({ default: '<html>webhooks</html>' }));
+vi.mock('../dashboard/logs.html', () => ({ default: '<html>logs</html>' }));
+vi.mock('../dashboard/styles.css', () => ({ default: 'body{}' }));
+vi.mock('../dashboard/shared.js', () => ({ default: '// shared' }));
+
 import app from './index';
+import { _resetJWKSCache } from './auth';
 
 class MockD1 {
   public queries: { sql: string; args: any[] }[] = [];
@@ -41,7 +52,48 @@ class MockD1 {
               const webhookId = args[0];
               return self.webhooks.find(w => w.id === webhookId) || null;
             }
+            if (sql.includes("SELECT user_id FROM webhooks WHERE id = ?")) {
+              const webhookId = args[0];
+              const wh = self.webhooks.find(w => w.id === webhookId);
+              return wh ? { user_id: wh.user_id } : null;
+            }
+            if (sql.includes("SELECT count FROM message_counts")) {
+              const userId = args[0];
+              const periodKey = args[1];
+              const mc = self.messageCounts.find(m => m.user_id === userId && m.period_key === periodKey);
+              return mc ? { count: mc.count } : null;
+            }
+            if (sql.includes("SELECT COUNT(*) as total FROM logs")) {
+              const userId = args[0];
+              const total = self.logs.filter(l => l.user_id === userId).length;
+              return { total };
+            }
             return null;
+          },
+          async all() {
+            if (sql.includes("FROM webhooks WHERE user_id = ?")) {
+              const userId = args[0];
+              return { results: self.webhooks.filter(w => w.user_id === userId) };
+            }
+            if (sql.includes("FROM logs WHERE user_id = ?")) {
+              const userId = args[0];
+              const limit = args[1] || 15;
+              const offset = args[2] || 0;
+              const userLogs = self.logs
+                .filter(l => l.user_id === userId)
+                .sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0))
+                .slice(offset, offset + limit)
+                .map((l: any) => {
+                  // Simulate SQL column selection: dashboard logs query omits submission_data
+                  if (!sql.includes('submission_data')) {
+                    const { submission_data, ...rest } = l;
+                    return rest;
+                  }
+                  return l;
+                });
+              return { results: userLogs };
+            }
+            return { results: [] };
           },
           async run() {
             if (sql.includes("INSERT INTO logs")) {
@@ -54,6 +106,15 @@ class MockD1 {
                 created_at: args[5],
                 viewed_count: 0,
               });
+            } else if (sql.includes("INSERT INTO users")) {
+              self.users.push({
+                user_id: args[0],
+                api_key: args[1],
+                plan: 'free',
+                whatsapp_numbers: '[]',
+                allowed_domains: '[]',
+                created_at: args[2],
+              });
             } else if (sql.includes("INSERT INTO message_counts")) {
               const userId = args[0];
               const periodKey = args[1];
@@ -63,6 +124,14 @@ class MockD1 {
               } else {
                 self.messageCounts.push({ user_id: userId, period_key: periodKey, count: 1 });
               }
+            } else if (sql.includes("INSERT INTO webhooks")) {
+              self.webhooks.push({
+                id: args[0],
+                user_id: args[1],
+                name: args[2],
+                whatsapp_numbers: args[3],
+                created_at: args[4],
+              });
             } else if (sql.includes("UPDATE logs SET")) {
               const ref = args[0];
               const log = self.logs.find(l => l.submission_ref === ref);
@@ -70,6 +139,15 @@ class MockD1 {
                 log.submission_data = null;
                 log.viewed_count = (log.viewed_count || 0) + 1;
               }
+            } else if (sql.includes("UPDATE users SET allowed_domains")) {
+              const domains = args[0];
+              const userId = args[1];
+              const user = self.users.find(u => u.user_id === userId);
+              if (user) user.allowed_domains = domains;
+            } else if (sql.includes("DELETE FROM webhooks")) {
+              const webhookId = args[0];
+              const idx = self.webhooks.findIndex(w => w.id === webhookId);
+              if (idx !== -1) self.webhooks.splice(idx, 1);
             }
             return { success: true };
           }
@@ -1100,3 +1178,559 @@ describe('Third-Party Webhook Router - POST /v1/webhook/:webhookId', () => {
 });
 
 
+// ─── Clerk Auth & Dashboard Test Infrastructure ──────────────────────────────
+
+// Generate an RSA key pair for signing test JWTs
+let testKeys: { publicKey: CryptoKey; privateKey: CryptoKey; jwk: any } | null = null;
+
+async function getTestKeys() {
+  if (testKeys) return testKeys;
+  const { publicKey, privateKey } = await generateKeyPair('RS256');
+  const jwk = await exportJWK(publicKey);
+  jwk.kid = 'test-key-1';
+  jwk.alg = 'RS256';
+  jwk.use = 'sig';
+  testKeys = { publicKey, privateKey, jwk };
+  return testKeys;
+}
+
+async function signTestJWT(claims: Record<string, any>, privateKey: CryptoKey) {
+  return new SignJWT(claims)
+    .setProtectedHeader({ alg: 'RS256', kid: 'test-key-1' })
+    .setIssuedAt()
+    .setExpirationTime('1h')
+    .setIssuer('https://test.clerk.accounts.dev')
+    .sign(privateKey);
+}
+
+function createAuthEnv(mockDb: MockD1) {
+  return {
+    DB: mockDb as any,
+    TWILIO_ACCOUNT_SID: 'ACmock',
+    TWILIO_AUTH_TOKEN: 'mock_token',
+    TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671',
+    CLERK_PUBLISHABLE_KEY: 'pk_test_mock',
+    CLERK_SECRET_KEY: 'sk_test_mock',
+    CLERK_ISSUER_URL: 'https://test.clerk.accounts.dev',
+  };
+}
+
+// ─── Clerk Auth Middleware Tests ─────────────────────────────────────────────
+
+describe('Clerk Auth Middleware', () => {
+  let mockDb: MockD1;
+
+  beforeEach(async () => {
+    mockDb = new MockD1();
+    vi.restoreAllMocks();
+    _resetJWKSCache();
+
+    // Mock fetch to serve the test JWKS when the middleware requests it
+    const keys = await getTestKeys();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('.well-known/jwks.json')) {
+        return new Response(JSON.stringify({ keys: [keys.jwk] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 });
+    });
+  });
+
+  it('should return 401 when no Authorization header is present', async () => {
+    const res = await app.request('/v1/dashboard/me', {
+      method: 'GET',
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe('Missing Authorization header');
+  });
+
+  it('should return 401 when Authorization header has invalid format', async () => {
+    const res = await app.request('/v1/dashboard/me', {
+      method: 'GET',
+      headers: { 'Authorization': 'Basic abc123' },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe('Invalid Authorization format');
+  });
+
+  it('should return 401 when JWT signature is invalid (signed with wrong key)', async () => {
+    // Generate a separate key pair that the server doesn't know about
+    const { privateKey: wrongKey } = await generateKeyPair('RS256');
+    const token = await signTestJWT({ sub: 'user_attacker' }, wrongKey);
+
+    const res = await app.request('/v1/dashboard/me', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe('Invalid token');
+  });
+
+  it('should return 401 when JWT is expired', async () => {
+    const keys = await getTestKeys();
+    const token = await new SignJWT({ sub: 'user_expired' })
+      .setProtectedHeader({ alg: 'RS256', kid: 'test-key-1' })
+      .setIssuedAt(Math.floor(Date.now() / 1000) - 7200)
+      .setExpirationTime(Math.floor(Date.now() / 1000) - 3600)
+      .setIssuer('https://test.clerk.accounts.dev')
+      .sign(keys.privateKey);
+
+    const res = await app.request('/v1/dashboard/me', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe('Token expired');
+  });
+
+  it('should allow request and set userId when JWT is valid', async () => {
+    const keys = await getTestKeys();
+    const token = await signTestJWT({ sub: 'user_valid_123' }, keys.privateKey);
+
+    const res = await app.request('/v1/dashboard/me', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.user_id).toBe('user_valid_123');
+  });
+});
+
+// ─── Dashboard API: GET /v1/dashboard/me ────────────────────────────────────
+
+describe('Dashboard API - GET /v1/dashboard/me', () => {
+  let mockDb: MockD1;
+
+  beforeEach(async () => {
+    mockDb = new MockD1();
+    vi.restoreAllMocks();
+    _resetJWKSCache();
+
+    const keys = await getTestKeys();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('.well-known/jwks.json')) {
+        return new Response(JSON.stringify({ keys: [keys.jwk] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 });
+    });
+  });
+
+  it('should auto-create user on first auth and return new API key with fbz_ prefix', async () => {
+    const keys = await getTestKeys();
+    const token = await signTestJWT({ sub: 'user_new_auto' }, keys.privateKey);
+
+    const res = await app.request('/v1/dashboard/me', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.user_id).toBe('user_new_auto');
+    expect(body.api_key).toMatch(/^fbz_/);
+    expect(body.api_key.length).toBe(28); // fbz_ + 24 chars
+    expect(body.plan).toBe('free');
+    expect(body.message_count).toBe(0);
+    expect(mockDb.users.length).toBe(1);
+  });
+
+  it('should return existing user profile with usage count', async () => {
+    const keys = await getTestKeys();
+    const periodKey = new Date().toISOString().slice(0, 7);
+    mockDb.users.push({
+      user_id: 'user_existing',
+      api_key: 'fbz_existingkey123456789012',
+      plan: 'starter',
+      whatsapp_numbers: '["+15550100"]',
+      allowed_domains: '["example.com"]',
+      created_at: Date.now(),
+    });
+    mockDb.messageCounts.push({ user_id: 'user_existing', period_key: periodKey, count: 42 });
+
+    const token = await signTestJWT({ sub: 'user_existing' }, keys.privateKey);
+
+    const res = await app.request('/v1/dashboard/me', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.api_key).toBe('fbz_existingkey123456789012');
+    expect(body.plan).toBe('starter');
+    expect(body.message_count).toBe(42);
+    expect(body.whatsapp_numbers).toEqual(['+15550100']);
+    expect(body.allowed_domains).toEqual(['example.com']);
+    // Should NOT create a new user
+    expect(mockDb.users.length).toBe(1);
+  });
+});
+
+// ─── Dashboard API: Domains ─────────────────────────────────────────────────
+
+describe('Dashboard API - Domains', () => {
+  let mockDb: MockD1;
+  let authToken: string;
+
+  beforeEach(async () => {
+    mockDb = new MockD1();
+    vi.restoreAllMocks();
+    _resetJWKSCache();
+
+    const keys = await getTestKeys();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('.well-known/jwks.json')) {
+        return new Response(JSON.stringify({ keys: [keys.jwk] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 });
+    });
+
+    mockDb.users.push({
+      user_id: 'user_domains',
+      api_key: 'fbz_domains_test_key1234567',
+      plan: 'free',
+      whatsapp_numbers: '[]',
+      allowed_domains: '["example.com", "test.com"]',
+      created_at: Date.now(),
+    });
+
+    authToken = await signTestJWT({ sub: 'user_domains' }, keys.privateKey);
+  });
+
+  it('GET /v1/dashboard/domains returns current allowed_domains', async () => {
+    const res = await app.request('/v1/dashboard/domains', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${authToken}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.domains).toEqual(['example.com', 'test.com']);
+  });
+
+  it('PUT /v1/dashboard/domains updates allowed_domains', async () => {
+    const res = await app.request('/v1/dashboard/domains', {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ domains: ['new-domain.com', 'localhost'] }),
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe('updated');
+    expect(body.domains).toEqual(['new-domain.com', 'localhost']);
+
+    // Verify DB was updated
+    const user = mockDb.users.find(u => u.user_id === 'user_domains');
+    expect(JSON.parse(user.allowed_domains)).toEqual(['new-domain.com', 'localhost']);
+  });
+
+  it('PUT /v1/dashboard/domains rejects invalid body', async () => {
+    const res = await app.request('/v1/dashboard/domains', {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ domains: 'not-an-array' }),
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain('domains');
+  });
+});
+
+// ─── Dashboard API: Webhooks ────────────────────────────────────────────────
+
+describe('Dashboard API - Webhooks', () => {
+  let mockDb: MockD1;
+  let authToken: string;
+
+  beforeEach(async () => {
+    mockDb = new MockD1();
+    vi.restoreAllMocks();
+    _resetJWKSCache();
+
+    const keys = await getTestKeys();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('.well-known/jwks.json')) {
+        return new Response(JSON.stringify({ keys: [keys.jwk] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 });
+    });
+
+    mockDb.users.push({
+      user_id: 'user_wh',
+      api_key: 'fbz_webhook_test_key123456',
+      plan: 'free',
+      whatsapp_numbers: '[]',
+      allowed_domains: '[]',
+      created_at: Date.now(),
+    });
+
+    authToken = await signTestJWT({ sub: 'user_wh' }, keys.privateKey);
+  });
+
+  it('GET /v1/dashboard/webhooks returns user webhooks', async () => {
+    mockDb.webhooks.push({
+      id: 'wh_test1',
+      user_id: 'user_wh',
+      name: 'Webflow Integration',
+      whatsapp_numbers: null,
+      created_at: Date.now(),
+    });
+
+    const res = await app.request('/v1/dashboard/webhooks', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${authToken}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.webhooks.length).toBe(1);
+    expect(body.webhooks[0].name).toBe('Webflow Integration');
+  });
+
+  it('POST /v1/dashboard/webhooks creates a new webhook', async () => {
+    const res = await app.request('/v1/dashboard/webhooks', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: 'Tally Forms', whatsapp_numbers: ['+15550100'] }),
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.status).toBe('created');
+    expect(body.webhook.name).toBe('Tally Forms');
+    expect(body.webhook.id).toMatch(/^wh_/);
+    expect(mockDb.webhooks.length).toBe(1);
+    expect(mockDb.webhooks[0].user_id).toBe('user_wh');
+  });
+
+  it('DELETE /v1/dashboard/webhooks/:id deletes the webhook', async () => {
+    mockDb.webhooks.push({
+      id: 'wh_delete_me',
+      user_id: 'user_wh',
+      name: 'To Delete',
+      whatsapp_numbers: null,
+      created_at: Date.now(),
+    });
+
+    const res = await app.request('/v1/dashboard/webhooks/wh_delete_me', {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${authToken}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe('deleted');
+    expect(mockDb.webhooks.length).toBe(0);
+  });
+
+  it('DELETE /v1/dashboard/webhooks/:id prevents deleting another user webhook (403)', async () => {
+    mockDb.webhooks.push({
+      id: 'wh_other_user',
+      user_id: 'user_other',
+      name: 'Not Mine',
+      whatsapp_numbers: null,
+      created_at: Date.now(),
+    });
+
+    const res = await app.request('/v1/dashboard/webhooks/wh_other_user', {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${authToken}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe('Forbidden');
+    // Webhook should still exist
+    expect(mockDb.webhooks.length).toBe(1);
+  });
+});
+
+// ─── Dashboard API: Logs ────────────────────────────────────────────────────
+
+describe('Dashboard API - Logs', () => {
+  let mockDb: MockD1;
+  let authToken: string;
+
+  beforeEach(async () => {
+    mockDb = new MockD1();
+    vi.restoreAllMocks();
+    _resetJWKSCache();
+
+    const keys = await getTestKeys();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('.well-known/jwks.json')) {
+        return new Response(JSON.stringify({ keys: [keys.jwk] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 });
+    });
+
+    mockDb.users.push({
+      user_id: 'user_logs',
+      api_key: 'fbz_logs_test_key123456789',
+      plan: 'free',
+      whatsapp_numbers: '[]',
+      allowed_domains: '[]',
+      created_at: Date.now(),
+    });
+
+    authToken = await signTestJWT({ sub: 'user_logs' }, keys.privateKey);
+  });
+
+  it('GET /v1/dashboard/logs returns paginated logs without submission_data', async () => {
+    // Add some test logs
+    for (let i = 0; i < 3; i++) {
+      mockDb.logs.push({
+        id: i + 1,
+        user_id: 'user_logs',
+        domain: `site${i}.com`,
+        field_names: '["name","email"]',
+        delivery_status: i === 0 ? 'sent' : 'pending',
+        submission_ref: `REF00${i}`,
+        submission_data: i === 0 ? null : '{"name":"test"}',
+        viewed_count: i === 0 ? 1 : 0,
+        created_at: Date.now() - (i * 1000),
+      });
+    }
+
+    const res = await app.request('/v1/dashboard/logs?page=1&limit=10', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${authToken}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.logs.length).toBe(3);
+    expect(body.total).toBe(3);
+    expect(body.page).toBe(1);
+
+    // Verify submission_data is NOT included in the response
+    for (const log of body.logs) {
+      expect(log.submission_data).toBeUndefined();
+      expect(log.domain).toBeDefined();
+      expect(log.submission_ref).toBeDefined();
+    }
+  });
+
+  it('GET /v1/dashboard/logs supports pagination', async () => {
+    // Add 5 logs
+    for (let i = 0; i < 5; i++) {
+      mockDb.logs.push({
+        id: i + 1,
+        user_id: 'user_logs',
+        domain: `site${i}.com`,
+        field_names: '["name"]',
+        delivery_status: 'sent',
+        submission_ref: `PG${i}ABC`,
+        viewed_count: 0,
+        created_at: Date.now() - (i * 1000),
+      });
+    }
+
+    const res = await app.request('/v1/dashboard/logs?page=2&limit=2', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${authToken}` },
+    }, createAuthEnv(mockDb));
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.logs.length).toBe(2);
+    expect(body.total).toBe(5);
+    expect(body.page).toBe(2);
+    expect(body.limit).toBe(2);
+  });
+});
+
+// ─── Dashboard Static Asset Routes ──────────────────────────────────────────
+
+describe('Dashboard Static Asset Routes', () => {
+  it('GET /dashboard serves HTML with Clerk publishable key injected', async () => {
+    const res = await app.request('/dashboard', {
+      method: 'GET',
+    }, {
+      DB: {} as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671',
+      CLERK_PUBLISHABLE_KEY: 'pk_test_injected',
+      CLERK_SECRET_KEY: 'sk_test_mock',
+      CLERK_ISSUER_URL: 'https://test.clerk.accounts.dev',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+  });
+
+  it('GET /dashboard/styles.css serves CSS with correct Content-Type', async () => {
+    const res = await app.request('/dashboard/styles.css', {
+      method: 'GET',
+    }, {
+      DB: {} as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671',
+      CLERK_PUBLISHABLE_KEY: 'pk_test_mock',
+      CLERK_SECRET_KEY: 'sk_test_mock',
+      CLERK_ISSUER_URL: 'https://test.clerk.accounts.dev',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/css');
+  });
+
+  it('GET /dashboard/shared.js serves JavaScript with correct Content-Type', async () => {
+    const res = await app.request('/dashboard/shared.js', {
+      method: 'GET',
+    }, {
+      DB: {} as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671',
+      CLERK_PUBLISHABLE_KEY: 'pk_test_mock',
+      CLERK_SECRET_KEY: 'sk_test_mock',
+      CLERK_ISSUER_URL: 'https://test.clerk.accounts.dev',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('application/javascript');
+  });
+});

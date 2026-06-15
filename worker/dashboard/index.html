@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="clerk-publishable-key" content="{{CLERK_PUBLISHABLE_KEY}}">
+  <meta name="description" content="FormBuzz Dashboard — Manage your form-to-WhatsApp delivery pipeline.">
+  <title>FormBuzz — Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <!-- Auth Screen -->
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="logo-lg">FB</div>
+      <h1>Welcome to FormBuzz</h1>
+      <p>Sign in to manage your form-to-WhatsApp delivery.</p>
+      <div id="clerk-auth"></div>
+    </div>
+  </div>
+
+  <!-- App Shell -->
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo">FB</div>
+        <h1>FormBuzz</h1>
+      </div>
+      <nav class="sidebar-nav" id="sidebar-nav"></nav>
+      <div class="sidebar-footer">
+        <div class="text-sm text-muted" id="sidebar-user"></div>
+        <button class="btn btn-ghost btn-sm mt-md" id="logout-btn" style="width:100%">Sign Out</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <div class="page-header">
+        <h2>Dashboard</h2>
+        <p>Your FormBuzz account overview.</p>
+      </div>
+
+      <div class="stats-grid" id="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">API Key</div>
+          <div class="stat-value text-sm mono" id="stat-api-key" style="font-size:0.9rem;word-break:break-all;">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Plan</div>
+          <div class="stat-value gradient" id="stat-plan">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Messages This Month</div>
+          <div class="stat-value gradient" id="stat-messages">—</div>
+        </div>
+      </div>
+
+      <div class="card" id="snippet-card">
+        <div class="card-title">📋 Script Embed Snippet</div>
+        <p class="text-sm text-muted mb-md">Paste this tag into your website's HTML to start capturing form submissions.</p>
+        <div class="code-block" id="snippet-code">
+          Loading...
+          <button class="btn btn-ghost btn-sm copy-btn" id="copy-snippet-btn">Copy</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:var(--space-lg)">
+        <div class="card-title">🔑 API Key</div>
+        <p class="text-sm text-muted mb-md">Use this key to authenticate your form submissions. Keep it secret.</p>
+        <div class="code-block" id="apikey-display">
+          Loading...
+          <button class="btn btn-ghost btn-sm copy-btn" id="copy-apikey-btn">Copy</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/dashboard/shared.js"></script>
+  <script>
+    FormBuzz.initClerk(function () {
+      FormBuzz.apiRequest("GET", "/v1/dashboard/me").then(function (data) {
+        document.getElementById("stat-api-key").textContent = data.api_key || "—";
+        document.getElementById("stat-plan").textContent = (data.plan || "free").toUpperCase();
+        document.getElementById("stat-messages").textContent = data.message_count != null ? data.message_count : "0";
+
+        var origin = window.location.origin;
+        var snippet = '<script src="' + origin + '/v1/s/formbuzz.js" data-api-key="' + (data.api_key || "") + '"></' + 'script>';
+        document.getElementById("snippet-code").innerHTML = snippet.replace(/</g, "&lt;").replace(/>/g, "&gt;") +
+          '<button class="btn btn-ghost btn-sm copy-btn" id="copy-snippet-btn">Copy</button>';
+        document.getElementById("apikey-display").innerHTML = (data.api_key || "") +
+          '<button class="btn btn-ghost btn-sm copy-btn" id="copy-apikey-btn">Copy</button>';
+
+        document.getElementById("copy-snippet-btn").addEventListener("click", function () {
+          FormBuzz.copyToClipboard(snippet);
+        });
+        document.getElementById("copy-apikey-btn").addEventListener("click", function () {
+          FormBuzz.copyToClipboard(data.api_key || "");
+        });
+      }).catch(function (err) {
+        FormBuzz.showToast(err.message, "error");
+      });
+    });
+  </script>
+</body>
+</html>

@@ -21,10 +21,21 @@
         "**/formbuzz.js"
       ],
       "fallthrough": true
+    },
+    {
+      "type": "Text",
+      "globs": [
+        "dashboard/*.html",
+        "dashboard/*.css",
+        "dashboard/*.js"
+      ],
+      "fallthrough": true
     }
   ],
   "vars": {
     "TWILIO_ACCOUNT_SID": "ACmock",
-    "TWILIO_WHATSAPP_NUMBER": "whatsapp:+14155552671"
+    "TWILIO_WHATSAPP_NUMBER": "whatsapp:+14155552671",
+    "CLERK_PUBLISHABLE_KEY": "pk_test_PLACEHOLDER",
+    "CLERK_ISSUER_URL": "https://your-instance.clerk.accounts.dev"
   }
 }
