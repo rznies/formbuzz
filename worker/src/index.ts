@@ -25,7 +25,7 @@ type Bindings = {
   CLERK_ISSUER_URL: string;
 };
 
-const app = new Hono<{ Bindings: Bindings; Variables: { userId: string } }>();
+export const app = new Hono<{ Bindings: Bindings; Variables: { userId: string } }>();
 
 
 app.get('/v1/s/formbuzz.js', (c) => {
@@ -122,10 +122,70 @@ app.post('/v1/submit/:apiKey', async (c) => {
   return c.json({ status: "success" }, 200);
 });
 
+// Twilio Signature Verification Helpers
+function timingSafeEqualString(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+async function computeTwilioSignature(url: string, params: URLSearchParams, authToken: string): Promise<string> {
+  const sorted = Array.from(params.entries()).sort(([a], [b]) => a.localeCompare(b));
+  const paramString = sorted.map(([key, value]) => `${key}${value}`).join('');
+  const payload = url + paramString;
+
+  const keyBytes = new TextEncoder().encode(authToken);
+  const dataBytes = new TextEncoder().encode(payload);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+
+  const signatureBuffer = await crypto.subtle.sign('HMAC', cryptoKey, dataBytes);
+  const signatureArray = new Uint8Array(signatureBuffer);
+  
+  let binary = '';
+  for (let i = 0; i < signatureArray.byteLength; i++) {
+    binary += String.fromCharCode(signatureArray[i]);
+  }
+  return btoa(binary);
+}
+
+async function verifyTwilioSignature(
+  url: string,
+  rawBody: string,
+  signature: string | null | undefined,
+  authToken: string
+): Promise<boolean> {
+  if (!signature) {
+    return false;
+  }
+  const params = new URLSearchParams(rawBody);
+  const expectedSignature = await computeTwilioSignature(url, params, authToken);
+  return timingSafeEqualString(signature, expectedSignature);
+}
+
 app.post('/v1/twilio/webhook', async (c) => {
-  const body = await c.req.parseBody();
-  const senderNumber = typeof body.From === 'string' ? body.From : '';
-  const incomingMessageText = typeof body.Body === 'string' ? body.Body.trim() : '';
+  const signature = c.req.header('X-Twilio-Signature');
+  const rawBody = await c.req.text();
+  const authToken = c.env.TWILIO_AUTH_TOKEN;
+
+  if (!await verifyTwilioSignature(c.req.url, rawBody, signature, authToken)) {
+    return c.text('Unauthorized', 401);
+  }
+
+  const params = new URLSearchParams(rawBody);
+  const senderNumber = params.get('From') || '';
+  const incomingMessageText = (params.get('Body') || '').trim();
 
   // 1. Clean number (e.g. whatsapp:+15550100 ➔ +15550100)
   const formattedSender = senderNumber.replace(/^whatsapp:/i, '');
@@ -598,5 +658,17 @@ app.get('/v1/dashboard/logs', async (c) => {
   });
 });
 
-export default app;
+export async function purgeOldSubmissionData(db: D1Database, nowMs = Date.now()): Promise<void> {
+  const cutoffMs = nowMs - 7 * 24 * 60 * 60 * 1000;
+  await db.prepare(
+    "UPDATE logs SET submission_data = NULL WHERE created_at < ? AND submission_data IS NOT NULL"
+  ).bind(cutoffMs).run();
+}
+
+export default {
+  fetch: app.fetch,
+  scheduled: async (_event: ScheduledEvent, env: Bindings, _ctx: ExecutionContext) => {
+    await purgeOldSubmissionData(env.DB, Date.now());
+  },
+};
 

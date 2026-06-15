@@ -19,7 +19,27 @@ vi.mock('../dashboard/logs.html', () => ({ default: '<html>logs</html>' }));
 vi.mock('../dashboard/styles.css', () => ({ default: 'body{}' }));
 vi.mock('../dashboard/shared.js', () => ({ default: '// shared' }));
 
-import app from './index';
+import worker, { app } from './index';
+
+async function signTwilioRequest(url: string, params: URLSearchParams, authToken: string) {
+  const sorted = Array.from(params.entries()).sort(([a], [b]) => a.localeCompare(b));
+  const payload = url + sorted.map(([key, value]) => `${key}${value}`).join('');
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(authToken),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
+}
+
+declare global {
+  interface Response {
+    json(): Promise<any>;
+  }
+}
 import { _resetJWKSCache } from './auth';
 
 class MockD1 {
@@ -133,11 +153,20 @@ class MockD1 {
                 created_at: args[4],
               });
             } else if (sql.includes("UPDATE logs SET")) {
-              const ref = args[0];
-              const log = self.logs.find(l => l.submission_ref === ref);
-              if (log) {
-                log.submission_data = null;
-                log.viewed_count = (log.viewed_count || 0) + 1;
+              if (sql.includes("created_at < ?")) {
+                const cutoff = args[0];
+                self.logs.forEach(l => {
+                  if (l.created_at < cutoff && l.submission_data !== null) {
+                    l.submission_data = null;
+                  }
+                });
+              } else {
+                const ref = args[0];
+                const log = self.logs.find(l => l.submission_ref === ref);
+                if (log) {
+                  log.submission_data = null;
+                  log.viewed_count = (log.viewed_count || 0) + 1;
+                }
               }
             } else if (sql.includes("UPDATE users SET allowed_domains")) {
               const domains = args[0];
@@ -464,13 +493,14 @@ describe('FormBuzz Ingestion API - POST /v1/submit/:apiKey', () => {
 
 describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
   let mockDb: MockD1;
+  const webhookUrl = 'https://api.formbuzz.test/v1/twilio/webhook';
 
   beforeEach(() => {
     mockDb = new MockD1();
     vi.restoreAllMocks();
   });
 
-  it('should parse body, extract ref, verify authorized sender, send details, and purge submission_data', async () => {
+  it('should reject requests with missing signature', async () => {
     mockDb.users.push({
       user_id: 'user_1',
       api_key: 'fbp_valid',
@@ -497,10 +527,114 @@ describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
       Body: 'Get Details F8X1Z9'
     }).toString();
 
-    const res = await app.request('/v1/twilio/webhook', {
+    const res = await app.request(webhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body
+    }, {
+      DB: mockDb as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe('Unauthorized');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Verify DB not mutated
+    const log = mockDb.logs[0];
+    expect(log.submission_data).not.toBeNull();
+    expect(log.viewed_count).toBe(0);
+  });
+
+  it('should reject requests with invalid signature', async () => {
+    mockDb.users.push({
+      user_id: 'user_1',
+      api_key: 'fbp_valid',
+      allowed_domains: '["*"]',
+      whatsapp_numbers: '["+15550100"]'
+    });
+
+    mockDb.logs.push({
+      user_id: 'user_1',
+      domain: 'test.com',
+      field_names: '["name", "email"]',
+      submission_ref: 'F8X1Z9',
+      submission_data: JSON.stringify({ name: 'Alice', email: 'alice@example.com' }),
+      created_at: Date.now(),
+      viewed_count: 0
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      return Promise.resolve(new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 }));
+    });
+
+    const body = new URLSearchParams({
+      From: 'whatsapp:+15550100',
+      Body: 'Get Details F8X1Z9'
+    }).toString();
+
+    const res = await app.request(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Twilio-Signature': 'invalid_sig'
+      },
+      body
+    }, {
+      DB: mockDb as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe('Unauthorized');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Verify DB not mutated
+    const log = mockDb.logs[0];
+    expect(log.submission_data).not.toBeNull();
+    expect(log.viewed_count).toBe(0);
+  });
+
+  it('should parse body, extract ref, verify authorized sender, send details, and purge submission_data', async () => {
+    mockDb.users.push({
+      user_id: 'user_1',
+      api_key: 'fbp_valid',
+      allowed_domains: '["*"]',
+      whatsapp_numbers: '["+15550100"]'
+    });
+
+    mockDb.logs.push({
+      user_id: 'user_1',
+      domain: 'test.com',
+      field_names: '["name", "email"]',
+      submission_ref: 'F8X1Z9',
+      submission_data: JSON.stringify({ name: 'Alice', email: 'alice@example.com' }),
+      created_at: Date.now(),
+      viewed_count: 0
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      return Promise.resolve(new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 }));
+    });
+
+    const params = new URLSearchParams({
+      From: 'whatsapp:+15550100',
+      Body: 'Get Details F8X1Z9'
+    });
+    const body = params.toString();
+    const signature = await signTwilioRequest(webhookUrl, params, 'mock_token');
+
+    const res = await app.request(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Twilio-Signature': signature
       },
       body
     }, {
@@ -537,15 +671,18 @@ describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
       return Promise.resolve(new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 }));
     });
 
-    const body = new URLSearchParams({
+    const params = new URLSearchParams({
       From: 'whatsapp:+15550100',
       Body: 'Get Details AB12CD'
-    }).toString();
+    });
+    const body = params.toString();
+    const signature = await signTwilioRequest(webhookUrl, params, 'mock_token');
 
-    const res = await app.request('/v1/twilio/webhook', {
+    const res = await app.request(webhookUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Twilio-Signature': signature
       },
       body
     }, {
@@ -586,15 +723,18 @@ describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
     });
 
     // Sender is +15550999 (Unauthorized)
-    const body = new URLSearchParams({
+    const params = new URLSearchParams({
       From: 'whatsapp:+15550999',
       Body: 'F8X1Z9'
-    }).toString();
+    });
+    const body = params.toString();
+    const signature = await signTwilioRequest(webhookUrl, params, 'mock_token');
 
-    const res = await app.request('/v1/twilio/webhook', {
+    const res = await app.request(webhookUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Twilio-Signature': signature
       },
       body
     }, {
@@ -641,15 +781,18 @@ describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
       return Promise.resolve(new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 }));
     });
 
-    const body = new URLSearchParams({
+    const params = new URLSearchParams({
       From: 'whatsapp:+15550100',
       Body: 'F8X1Z9'
-    }).toString();
+    });
+    const body = params.toString();
+    const signature = await signTwilioRequest(webhookUrl, params, 'mock_token');
 
-    const res = await app.request('/v1/twilio/webhook', {
+    const res = await app.request(webhookUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Twilio-Signature': signature
       },
       body
     }, {
@@ -672,15 +815,18 @@ describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
       return Promise.resolve(new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 }));
     });
 
-    const body = new URLSearchParams({
+    const params = new URLSearchParams({
       From: 'whatsapp:+15550100',
       Body: 'Hello World'
-    }).toString();
+    });
+    const body = params.toString();
+    const signature = await signTwilioRequest(webhookUrl, params, 'mock_token');
 
-    const res = await app.request('/v1/twilio/webhook', {
+    const res = await app.request(webhookUrl, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Twilio-Signature': signature
       },
       body
     }, {
@@ -693,6 +839,76 @@ describe('Twilio Webhook - POST /v1/twilio/webhook', () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toBe('<Response></Response>');
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Scheduled purge', () => {
+  let mockDb: MockD1;
+
+  beforeEach(() => {
+    mockDb = new MockD1();
+    vi.restoreAllMocks();
+  });
+
+  it('should purge sensitive logs older than 7 days and leave recent or already-purged logs unchanged', async () => {
+    const now = Date.now();
+    const eightDaysAgo = now - 8 * 24 * 60 * 60 * 1000;
+    const sixDaysAgo = now - 6 * 24 * 60 * 60 * 1000;
+    const nineDaysAgo = now - 9 * 24 * 60 * 60 * 1000;
+
+    // Seed logs
+    mockDb.logs.push({
+      user_id: 'user_1',
+      domain: 'old.com',
+      field_names: '["email"]',
+      submission_ref: 'OLD123',
+      submission_data: JSON.stringify({ email: 'old@example.com' }),
+      created_at: eightDaysAgo,
+      viewed_count: 0,
+      delivery_status: 'sent'
+    });
+
+    mockDb.logs.push({
+      user_id: 'user_1',
+      domain: 'recent.com',
+      field_names: '["email"]',
+      submission_ref: 'REC123',
+      submission_data: JSON.stringify({ email: 'recent@example.com' }),
+      created_at: sixDaysAgo,
+      viewed_count: 0,
+      delivery_status: 'sent'
+    });
+
+    mockDb.logs.push({
+      user_id: 'user_1',
+      domain: 'purged.com',
+      field_names: '["email"]',
+      submission_ref: 'PRG123',
+      submission_data: null,
+      created_at: nineDaysAgo,
+      viewed_count: 2,
+      delivery_status: 'sent'
+    });
+
+    await worker.scheduled(
+      {} as ScheduledEvent,
+      { DB: mockDb as any } as any,
+      {} as ExecutionContext
+    );
+
+    const oldLog = mockDb.logs.find(l => l.submission_ref === 'OLD123');
+    expect(oldLog.submission_data).toBeNull();
+    expect(oldLog.viewed_count).toBe(0);
+    expect(oldLog.domain).toBe('old.com');
+    expect(oldLog.delivery_status).toBe('sent');
+
+    const recentLog = mockDb.logs.find(l => l.submission_ref === 'REC123');
+    expect(JSON.parse(recentLog.submission_data)).toEqual({ email: 'recent@example.com' });
+    expect(recentLog.viewed_count).toBe(0);
+
+    const purgedLog = mockDb.logs.find(l => l.submission_ref === 'PRG123');
+    expect(purgedLog.submission_data).toBeNull();
+    expect(purgedLog.viewed_count).toBe(2);
   });
 });
 
