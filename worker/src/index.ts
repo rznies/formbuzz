@@ -256,4 +256,95 @@ async function sendTwilioFreeform(
   });
 }
 
+function flattenJson(obj: any, prefix = ""): Record<string, string> {
+  let result: Record<string, string> = {};
+  if (typeof obj !== 'object' || obj === null) {
+    return result;
+  }
+  for (const [key, value] of Object.entries(obj)) {
+    const finalKey = prefix ? `${prefix}.${key}` : key;
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      Object.assign(result, flattenJson(value, finalKey));
+    } else if (Array.isArray(value)) {
+      result[finalKey] = value.map(v => typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)).join(", ");
+    } else if (value === null || value === undefined) {
+      result[finalKey] = "";
+    } else {
+      result[finalKey] = String(value);
+    }
+  }
+  return result;
+}
+
+app.post('/v1/webhook/:webhookId', async (c) => {
+  const webhookId = c.req.param('webhookId');
+  let rawPayload: any;
+  try {
+    rawPayload = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON payload" }, 400);
+  }
+
+  // 1. Fetch Webhook Configuration
+  const webhook = await c.env.DB.prepare(
+    "SELECT * FROM webhooks WHERE id = ?"
+  ).bind(webhookId).first();
+
+  if (!webhook) {
+    return c.json({ error: "Invalid webhook ID" }, 404);
+  }
+
+  // 2. Fetch User Configuration
+  const user = await c.env.DB.prepare(
+    "SELECT * FROM users WHERE user_id = ?"
+  ).bind((webhook as any).user_id).first();
+
+  if (!user) {
+    return c.json({ error: "User not found" }, 404);
+  }
+
+  // 3. Flatten and clean payload
+  const cleanedPayload = flattenJson(rawPayload);
+  const ignoreKeys = ['event', 'eventId', 'createdAt', 'webhookId', 'timestamp', 'secret'];
+  for (const key of Object.keys(cleanedPayload)) {
+    const lastSegment = key.split('.').pop() || '';
+    if (ignoreKeys.includes(lastSegment)) {
+      delete cleanedPayload[key];
+    }
+  }
+
+  // 4. Generate Reference & Save Data
+  const submissionRef = generateUniqueRefCode();
+  const fieldNames = JSON.stringify(Object.keys(cleanedPayload));
+
+  await c.env.DB.prepare(
+    `INSERT INTO logs (user_id, domain, field_names, submission_ref, submission_data, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(
+    (user as any).user_id,
+    (webhook as any).name,
+    fieldNames,
+    submissionRef,
+    JSON.stringify(cleanedPayload),
+    Date.now()
+   ).run();
+
+  // 5. Dispatch Twilio WhatsApp Template
+  const recipients = JSON.parse((webhook as any).whatsapp_numbers || (user as any).whatsapp_numbers || "[]");
+  for (const number of recipients) {
+    await sendTwilioTemplate(c.env, number, (webhook as any).name, submissionRef);
+  }
+
+  // 6. Update Message Counter
+  const periodKey = new Date().toISOString().slice(0, 7);
+  await c.env.DB.prepare(
+    `INSERT INTO message_counts (user_id, period_key, count)
+     VALUES (?, ?, 1)
+     ON CONFLICT(user_id, period_key)
+     DO UPDATE SET count = count + 1`
+  ).bind((user as any).user_id, periodKey).run();
+
+  return c.json({ status: "success" }, 200);
+});
+
 export default app;

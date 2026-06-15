@@ -16,6 +16,7 @@ class MockD1 {
   public users: any[] = [];
   public logs: any[] = [];
   public messageCounts: any[] = [];
+  public webhooks: any[] = [];
 
   prepare(sql: string) {
     const self = this;
@@ -35,6 +36,10 @@ class MockD1 {
             if (sql.includes("FROM users WHERE user_id = ?")) {
               const userId = args[0];
               return self.users.find(u => u.user_id === userId) || null;
+            }
+            if (sql.includes("SELECT * FROM webhooks WHERE id = ?")) {
+              const webhookId = args[0];
+              return self.webhooks.find(w => w.id === webhookId) || null;
             }
             return null;
           },
@@ -884,4 +889,214 @@ describe('formbuzz.js Client Script Logic Unit Tests', () => {
     });
   });
 });
+
+describe('Third-Party Webhook Router - POST /v1/webhook/:webhookId', () => {
+  let mockDb: MockD1;
+
+  beforeEach(() => {
+    mockDb = new MockD1();
+    vi.restoreAllMocks();
+  });
+
+  it('should return 404 if the webhookId does not exist in the database', async () => {
+    const res = await app.request('/v1/webhook/wh_invalid', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ data: 'hello' })
+    }, {
+      DB: mockDb as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Invalid webhook ID' });
+  });
+
+  it('should return 404 if the owner user of the webhook does not exist', async () => {
+    mockDb.webhooks.push({
+      id: 'wh_valid',
+      user_id: 'user_nonexistent',
+      name: 'Test Webhook',
+      whatsapp_numbers: '["+15550100"]'
+    });
+
+    const res = await app.request('/v1/webhook/wh_valid', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ data: 'hello' })
+    }, {
+      DB: mockDb as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'User not found' });
+  });
+
+  it('should return 400 for invalid JSON payload', async () => {
+    mockDb.webhooks.push({
+      id: 'wh_valid',
+      user_id: 'user_1',
+      name: 'Test Webhook',
+      whatsapp_numbers: '["+15550100"]'
+    });
+
+    const res = await app.request('/v1/webhook/wh_valid', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: '{ invalid-json }'
+    }, {
+      DB: mockDb as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'Invalid JSON payload' });
+  });
+
+  it('should successfully flatten and scrub the payload, log to D1, send Twilio messages, and increment message counter', async () => {
+    mockDb.users.push({
+      user_id: 'user_1',
+      api_key: 'fbp_valid',
+      allowed_domains: '["*"]',
+      whatsapp_numbers: '["+15550100"]'
+    });
+
+    mockDb.webhooks.push({
+      id: 'wh_1',
+      user_id: 'user_1',
+      name: 'Webflow Integration',
+      whatsapp_numbers: null
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      return Promise.resolve(new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 }));
+    });
+
+    const payload = {
+      name: 'Bob',
+      contact: {
+        email: 'bob@test.com',
+        phone: '555-1234'
+      },
+      metadata: {
+        secret: 'should-be-removed',
+        event: 'form-submit'
+      },
+      tags: ['alpha', 'beta'],
+      timestamp: 123456789
+    };
+
+    const res = await app.request('/v1/webhook/wh_1', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }, {
+      DB: mockDb as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: 'success' });
+
+    // Assert log entry in D1
+    expect(mockDb.logs.length).toBe(1);
+    const log = mockDb.logs[0];
+    expect(log.user_id).toBe('user_1');
+    expect(log.domain).toBe('Webflow Integration');
+    expect(JSON.parse(log.field_names)).toEqual(['name', 'contact.email', 'contact.phone', 'tags']);
+    expect(log.submission_ref).toMatch(/^[A-Z0-9]{6}$/);
+
+    const submissionData = JSON.parse(log.submission_data);
+    expect(submissionData).toEqual({
+      name: 'Bob',
+      'contact.email': 'bob@test.com',
+      'contact.phone': '555-1234',
+      tags: 'alpha, beta'
+    });
+    // Verify metadata keys are scrubbed
+    expect(submissionData['metadata.secret']).toBeUndefined();
+    expect(submissionData['metadata.event']).toBeUndefined();
+    expect(submissionData.event).toBeUndefined();
+    expect(submissionData.eventId).toBeUndefined();
+    expect(submissionData.createdAt).toBeUndefined();
+    expect(submissionData.webhookId).toBeUndefined();
+    expect(submissionData.timestamp).toBeUndefined();
+    expect(submissionData.secret).toBeUndefined();
+
+    // Assert Twilio template sent to user default recipient
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const bodySent = new URLSearchParams(fetchSpy.mock.calls[0][1]?.body as any);
+    expect(bodySent.get('To')).toBe('whatsapp:+15550100');
+    expect(bodySent.get('Body')).toContain('Webflow Integration');
+    expect(bodySent.get('Body')).toContain(log.submission_ref);
+
+    // Assert message count updated
+    const currentPeriod = new Date().toISOString().slice(0, 7);
+    expect(mockDb.messageCounts.length).toBe(1);
+    const mc = mockDb.messageCounts[0];
+    expect(mc.user_id).toBe('user_1');
+    expect(mc.period_key).toBe(currentPeriod);
+    expect(mc.count).toBe(1);
+  });
+
+  it('should override recipient numbers if whatsapp_numbers is defined at the webhook level', async () => {
+    mockDb.users.push({
+      user_id: 'user_1',
+      api_key: 'fbp_valid',
+      allowed_domains: '["*"]',
+      whatsapp_numbers: '["+15550100"]'
+    });
+
+    mockDb.webhooks.push({
+      id: 'wh_1',
+      user_id: 'user_1',
+      name: 'Overridden Integration',
+      whatsapp_numbers: '["+15550999", "+15550888"]'
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      return Promise.resolve(new Response(JSON.stringify({ sid: 'SMmock' }), { status: 200 }));
+    });
+
+    const res = await app.request('/v1/webhook/wh_1', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ message: 'hi' })
+    }, {
+      DB: mockDb as any,
+      TWILIO_ACCOUNT_SID: 'ACmock',
+      TWILIO_AUTH_TOKEN: 'mock_token',
+      TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155552671'
+    });
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const call1 = new URLSearchParams(fetchSpy.mock.calls[0][1]?.body as any);
+    const call2 = new URLSearchParams(fetchSpy.mock.calls[1][1]?.body as any);
+
+    expect(call1.get('To')).toBe('whatsapp:+15550999');
+    expect(call2.get('To')).toBe('whatsapp:+15550888');
+  });
+});
+
 
