@@ -1,0 +1,8 @@
+# Cloudflare and Node local folders
+node_modules/
+.dev.vars
+.wrangler/
+dist/
+
+# Local raw scraps (not needed in repo)
+scrapes/
